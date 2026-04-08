@@ -29,8 +29,11 @@ MQTT_PASS = os.environ["MOSQUITTO_PASSWORD"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "capstone/energy")
 
-# Track the latest uptime to detect buffered readings
-latest_uptime_ms = 0
+# Timestamp reconstruction state
+# We pair each uptime with the wall-clock time we received it,
+# then use uptime differences to compute real timestamps.
+last_uptime_ms = 0
+last_wall_time = None
 
 """Connect to Postgres using the DATABASE_URL."""
 def get_db_connection():
@@ -45,7 +48,7 @@ def on_connect(client, userdata, flags, rc):
 
 """Called when a message arrives on the subscribed topic."""
 def on_message(client, userdata, msg):
-    global latest_uptime_ms
+    global last_uptime_ms, last_wall_time
 
     try:
         payload = json.loads(msg.payload.decode())
@@ -55,15 +58,30 @@ def on_message(client, userdata, msg):
 
         now = datetime.now(timezone.utc)
 
-        # If this reading's uptime is older than the latest seen, it's a buffered reading. Back-calculate its real timestamp.
-        if uptime_ms < latest_uptime_ms and latest_uptime_ms > 0:
-            age_ms = latest_uptime_ms - uptime_ms
-            reading_time = now - timedelta(milliseconds=age_ms)
-            source = "buffered"
-        else:
+        if last_wall_time is None:
+            # Very first message ever — anchor the timeline
             reading_time = now
-            latest_uptime_ms = uptime_ms
-            source = "live"
+            source = "live (first)"
+        elif uptime_ms <= last_uptime_ms:
+            # Device rebooted (uptime went backwards) — reset anchor
+            reading_time = now
+            source = "live (reboot)"
+        else:
+            # Normal case: compute time from uptime delta
+            # If messages arrive in real-time, uptime delta ≈ wall-clock delta
+            # If messages are buffered, uptime delta reflects the real spacing
+            uptime_delta_ms = uptime_ms - last_uptime_ms
+            reading_time = last_wall_time + timedelta(milliseconds=uptime_delta_ms)
+
+            # Don't let computed time drift into the future
+            if reading_time > now:
+                reading_time = now
+
+            source = "computed"
+
+        # Update anchor
+        last_uptime_ms = uptime_ms
+        last_wall_time = reading_time
 
         print(f"Received ({source}): uptime={uptime_ms}ms, wh={wh}, "
               f"total_wh={total_wh}, time={reading_time.isoformat()}")
