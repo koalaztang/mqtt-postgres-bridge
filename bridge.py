@@ -19,13 +19,18 @@ import time
 import psycopg2
 import paho.mqtt.client as mqtt
 
-# Config from Railway environment variables ───────────────────────
+from datetime import datetime, timezone, timedelta
+
+# Config from Railway environment variables
 MQTT_HOST = os.environ["MOSQUITTO_TCP_HOST"]
 MQTT_PORT = int(os.environ["MOSQUITTO_TCP_PORT"])
 MQTT_USER = os.environ["MOSQUITTO_USERNAME"]
 MQTT_PASS = os.environ["MOSQUITTO_PASSWORD"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "capstone/energy")
+
+# Track the latest uptime to detect buffered readings
+latest_uptime_ms = 0
 
 """Connect to Postgres using the DATABASE_URL."""
 def get_db_connection():
@@ -40,29 +45,44 @@ def on_connect(client, userdata, flags, rc):
 
 """Called when a message arrives on the subscribed topic."""
 def on_message(client, userdata, msg):
+    global latest_uptime_ms
+
     try:
         payload = json.loads(msg.payload.decode())
         uptime_ms = payload.get("ts", 0)
         wh = payload.get("wh", 0)
         total_wh = payload.get("total_wh", 0)
 
-        print(f"Received: uptime={uptime_ms}ms, wh={wh}, total_wh={total_wh}")
+        now = datetime.now(timezone.utc)
 
-        # Insert into Postgres
+        # If this reading's uptime is older than the latest seen, it's a buffered reading. Back-calculate its real timestamp.
+        if uptime_ms < latest_uptime_ms and latest_uptime_ms > 0:
+            age_ms = latest_uptime_ms - uptime_ms
+            reading_time = now - timedelta(milliseconds=age_ms)
+            source = "buffered"
+        else:
+            reading_time = now
+            latest_uptime_ms = uptime_ms
+            source = "live"
+
+        print(f"Received ({source}): uptime={uptime_ms}ms, wh={wh}, "
+              f"total_wh={total_wh}, time={reading_time.isoformat()}")
+
+        # Insert with the computed timestamp
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO energy_readings (uptime_ms, wh, total_wh)
-            VALUES (%s, %s, %s)
+            INSERT INTO energy_readings (received_at, uptime_ms, wh, total_wh)
+            VALUES (%s, %s, %s, %s)
             """,
-            (uptime_ms, wh, total_wh),
+            (reading_time, uptime_ms, wh, total_wh),
         )
         conn.commit()
         cur.close()
         conn.close()
 
-        print(f"  → Inserted into database")
+        print(f"  -> Inserted into database")
 
     except json.JSONDecodeError:
         print(f"Invalid JSON: {msg.payload}")
