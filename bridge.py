@@ -29,11 +29,11 @@ MQTT_PASS = os.environ["MOSQUITTO_PASSWORD"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "capstone/energy")
 
-# Timestamp reconstruction state
-# We pair each uptime with the wall-clock time we received it,
-# then use uptime differences to compute real timestamps.
-last_uptime_ms = 0
-last_wall_time = None
+# Anchor for timestamp reconstruction
+# When we see a live message, we record (uptime, wall_time).
+# Buffered messages use the anchor to compute their real time.
+anchor_uptime_ms = 0
+anchor_wall_time = None
 
 """Connect to Postgres using the DATABASE_URL."""
 def get_db_connection():
@@ -48,40 +48,28 @@ def on_connect(client, userdata, flags, rc):
 
 """Called when a message arrives on the subscribed topic."""
 def on_message(client, userdata, msg):
-    global last_uptime_ms, last_wall_time
+    global anchor_uptime_ms, anchor_wall_time
 
     try:
         payload = json.loads(msg.payload.decode())
         uptime_ms = payload.get("ts", 0)
         wh = payload.get("wh", 0)
         total_wh = payload.get("total_wh", 0)
+        is_buffered = payload.get("buf", 0) == 1
 
         now = datetime.now(timezone.utc)
 
-        if last_wall_time is None:
-            # Very first message ever — anchor the timeline
-            reading_time = now
-            source = "live (first)"
-        elif uptime_ms <= last_uptime_ms:
-            # Device rebooted (uptime went backwards) — reset anchor
-            reading_time = now
-            source = "live (reboot)"
+        if is_buffered and anchor_wall_time is not None:
+            # Buffered reading: compute real timestamp from anchor
+            offset_ms = uptime_ms - anchor_uptime_ms
+            reading_time = anchor_wall_time + timedelta(milliseconds=offset_ms)
+            source = "buffered"
         else:
-            # Normal case: compute time from uptime delta
-            # If messages arrive in real-time, uptime delta ≈ wall-clock delta
-            # If messages are buffered, uptime delta reflects the real spacing
-            uptime_delta_ms = uptime_ms - last_uptime_ms
-            reading_time = last_wall_time + timedelta(milliseconds=uptime_delta_ms)
-
-            # Don't let computed time drift into the future
-            if reading_time > now:
-                reading_time = now
-
-            source = "computed"
-
-        # Update anchor
-        last_uptime_ms = uptime_ms
-        last_wall_time = reading_time
+            # Live reading: use current time and update anchor
+            reading_time = now
+            anchor_uptime_ms = uptime_ms
+            anchor_wall_time = now
+            source = "live"
 
         print(f"Received ({source}): uptime={uptime_ms}ms, wh={wh}, "
               f"total_wh={total_wh}, time={reading_time.isoformat()}")
