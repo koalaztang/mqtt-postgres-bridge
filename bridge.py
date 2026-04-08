@@ -55,36 +55,21 @@ def on_message(client, userdata, msg):
         uptime_ms = payload.get("ts", 0)
         wh = payload.get("wh", 0)
         total_wh = payload.get("total_wh", 0)
+        is_buffered = payload.get("buf", 0) == 1
 
         now = datetime.now(timezone.utc)
 
-        # Detect a device restart (uptime resets to 0) and clear the anchor
-        if anchor_uptime_ms is not None and uptime_ms < anchor_uptime_ms:
-            print("Device restart detected. Resetting time anchor.")
-            anchor_wall_time = None
-
-        if anchor_wall_time is not None:
-            # Always compute timestamp relative to the anchor.
-            # This perfectly spaces out TCP-flushed bursts and RAM buffers alike.
+        if is_buffered and anchor_wall_time is not None:
+            # Buffered reading: compute real timestamp from anchor
             offset_ms = uptime_ms - anchor_uptime_ms
             reading_time = anchor_wall_time + timedelta(milliseconds=offset_ms)
-
-            # Prevent long-term clock drift: Only advance the anchor if the 
-            # message arrived roughly when we mathematically expected it to 
-            # (meaning it's a true, live, on-time reading).
-            time_diff = (now - reading_time).total_seconds()
-            if abs(time_diff) < 15:  
-                anchor_uptime_ms = uptime_ms
-                anchor_wall_time = now
-                source = "live"
-            else:
-                source = "recovered"
+            source = "buffered"
         else:
-            # First message received in this bridge session. Establish the anchor.
+            # Live reading: use current time and update anchor
             reading_time = now
             anchor_uptime_ms = uptime_ms
             anchor_wall_time = now
-            source = "anchor_init"
+            source = "live"
 
         print(f"Received ({source}): uptime={uptime_ms}ms, wh={wh}, "
               f"total_wh={total_wh}, time={reading_time.isoformat()}")
@@ -102,6 +87,8 @@ def on_message(client, userdata, msg):
         conn.commit()
         cur.close()
         conn.close()
+
+        print(f"  -> Inserted into database")
 
     except json.JSONDecodeError:
         print(f"Invalid JSON: {msg.payload}")
